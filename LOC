@@ -1,0 +1,417 @@
+api='3.9.0'
+version='0.0.1'
+tside=Tside.ASSET
+
+parameters = [
+    Parameter(
+        name='denomination',
+        shape=DenominationShape,
+        level=Level.TEMPLATE
+    ),
+    Parameter(
+        name='credit_account_id',
+        shape=AccountIdShape,
+        level=Level.INSTANCE,
+        default_value=0
+    ),
+    Parameter(
+        name='tenor',
+        shape=NumberShape,
+        level=Level.INSTANCE,
+        default_value=0
+    ),
+    Parameter(
+        name='loan',
+        shape=NumberShape,
+        level=Level.INSTANCE,
+        default_value=0
+    ),
+    Parameter(
+        name='emi',
+        shape=NumberShape,
+        level=Level.INSTANCE,
+        default_value=0,
+        derived=True
+    ),
+    Parameter(
+        name='total_interest',
+        shape=NumberShape,
+        level=Level.INSTANCE,
+        default_value=0,
+        derived=True
+    )
+]
+
+@requires(parameters=True, balances='1 days')
+def derived_parameters(effective_date):
+    principal_loan=vault.get_parameter_timeseries(name='loan').latest()  
+    tenor=vault.get_parameter_timeseries(name='tenor').latest() 
+    return {
+        'total_interest': _calculate_total_interest(vault, principal_loan, tenor),
+        'emi': _calculate_emi(vault, principal_loan, tenor)
+    }
+
+def _calculate_total_interest(vault, principal_loan, tenor): 
+    interest_rate = _set_up_interest_fee(vault, tenor)['interest_rate']
+    total_interest = principal_loan * (interest_rate/12)*tenor
+    return _precision_up_2_decimal(total_interest)
+
+def _calculate_emi(vault, principal_loan, tenor):
+    total_interest = _calculate_total_interest(vault, principal_loan, tenor)
+    emi = (total_interest + principal_loan) / tenor
+    return _precision_up_2_decimal(emi)
+
+@requires(parameters=True)
+def post_activate_code():
+    denomination=vault.get_parameter_timeseries(name='denomination').latest()  
+    principal_loan=vault.get_parameter_timeseries(name='loan').latest()  
+    tenor=vault.get_parameter_timeseries(name='tenor').latest() 
+    credit_card_account_id=vault.get_parameter_timeseries(name='credit_account_id').latest()
+
+    fee = _set_up_interest_fee(vault, tenor)['fee_rate']*principal_loan
+    posting_ins = vault.make_internal_transfer_instructions(
+        amount = principal_loan,
+        denomination = denomination,
+        client_transaction_id=vault.get_hook_execution_id()+'PRINCIPAL_LOC',
+        from_account_id =vault.account_id,
+        from_account_address = 'OUTSTANDING_PRINCIPAL',
+        to_account_id = credit_card_account_id,
+        to_account_address = 'PRINCIPAL_LOC',
+        instruction_details={"type": "LOAN_ON_CARD_ACTIVATION"},
+        asset=DEFAULT_ASSET
+    )
+    posting_ins.extend(
+        vault.make_internal_transfer_instructions(
+            amount = _calculate_total_interest(vault, principal_loan, tenor),
+            denomination = denomination,
+            client_transaction_id=vault.get_hook_execution_id()+'INTEREST_LOC',
+            from_account_id =vault.account_id,
+            from_account_address = 'OUTSTANDING_INTEREST',
+            to_account_id = credit_card_account_id,
+            to_account_address = 'INTEREST_LOC',
+            instruction_details={"type": "LOAN_ON_CARD_ACTIVATION"},
+            asset=DEFAULT_ASSET
+        )
+    )
+    posting_ins.extend(
+        vault.make_internal_transfer_instructions(
+            amount = fee,
+            denomination = denomination,
+            client_transaction_id=vault.get_hook_execution_id()+'FEE_LOC',
+            from_account_id =vault.account_id,
+            from_account_address = 'OUTSTANDING_FEE',
+            to_account_id = credit_card_account_id,
+            to_account_address = 'FEE_LOC',
+            instruction_details={"type": "LOAN_ON_CARD_ACTIVATION"},
+            asset=DEFAULT_ASSET
+        )
+    )
+    vault.instruct_posting_batch(
+        posting_instructions = posting_ins,
+        effective_date = _get_open_date(vault)
+    )
+
+
+def _get_payment_day(vault):
+    open_account_day = vault.get_account_creation_date().day
+    if open_account_day > 28:
+        applied_day = 28
+    else:
+        applied_day = open_account_day 
+    return applied_day 
+
+
+@requires(parameters=True)
+def execution_schedules():
+    applied_day = _get_payment_day(vault)
+    return [
+        (
+            'ACCRUED_INTEREST', {
+                'hour': '23',
+                'minute': '59',
+                'second': '59'
+            }
+        ),
+        (
+            'APPLIED_INTEREST', {
+                'day': str(applied_day),
+                'hour': '23',
+                'minute': '59',
+                'second': '54'
+            }
+        )
+
+    ]
+
+@requires(event_type='APPLIED_INTEREST', parameters=True, balances='latest')
+@requires(event_type='ACCRUED_INTEREST', parameters=True, balances='latest', last_execution_time=['APPLIED_INTEREST'])
+def scheduled_code(event_type, effective_date):
+    if event_type == 'ACCRUED_INTEREST':
+        _accrued_daily(vault, effective_date)
+    if event_type == 'APPLIED_INTEREST':
+        _applied_monthly(vault, effective_date)
+
+def _get_open_date(vault):
+    return vault.get_account_creation_date()
+
+def _get_last_day_installment(vault):
+    tenor=vault.get_parameter_timeseries(name='tenor').latest() 
+    if vault.get_account_creation_date().day > 28:
+        last_default_day = vault.get_account_creation_date().replace(day=28) +timedelta(months=tenor)
+    else:
+        last_default_day = _get_open_date(vault) + timedelta(months=tenor)
+    return last_default_day
+
+def _accrued_daily(vault, effective_date):
+    denomination=vault.get_parameter_timeseries(name='denomination').latest()  
+    principal_loan=vault.get_parameter_timeseries(name='loan').latest()  
+    tenor=vault.get_parameter_timeseries(name='tenor').latest() 
+    last_default_day = _get_last_day_installment(vault)
+    emi = _calculate_emi(vault, principal_loan, tenor)
+    last_emi =  emi - ((emi * tenor) - principal_loan - _calculate_total_interest(vault, principal_loan, tenor))
+    num_days_in_installment = _get_number_days_in_installment(vault)
+    irr_per_month = 0.0553217 * num_days_in_installment / 365
+    balances = vault.get_balance_timeseries().at(timestamp=effective_date)
+    outstanding_principal = balances[('OUTSTANDING_PRINCIPAL', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+    interest_per_month = _precision_up_2_decimal(irr_per_month * outstanding_principal)
+    principal_per_month = emi - interest_per_month
+    accrued_interest = _precision_up_2_decimal(interest_per_month/num_days_in_installment)
+    accrued_principal = _precision_up_2_decimal(principal_per_month/num_days_in_installment)
+    # Last day installment
+    if effective_date.day == _get_payment_day(vault) - 1:
+        # last month
+        if effective_date + timedelta(months=1) > last_default_day :
+            interest_last_month = last_emi - outstanding_principal
+            amount_interest_last_installment =  interest_last_month - balances[('ACCRUED_INTEREST', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+            amount_principal_last_installment = outstanding_principal - balances[('ACCRUED_PRINCIPAL', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+            posting_ins = vault.make_internal_transfer_instructions(
+                amount = amount_interest_last_installment,
+                denomination = denomination,
+                from_account_id = vault.account_id,
+                from_account_address = 'ACCRUED_INTEREST',
+                to_account_id =  vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={'type':'interest last month last day'},
+                client_transaction_id =vault.get_hook_execution_id()+'INTEREST_DAILY'+ 'last day',
+                asset=DEFAULT_ASSET
+            )
+            posting_ins.extend(vault.make_internal_transfer_instructions(
+                amount = amount_principal_last_installment,
+                denomination = denomination,
+                from_account_id = vault.account_id,
+                from_account_address = 'ACCRUED_PRINCIPAL',
+                to_account_id =  vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={'type':'principal last month last day'},
+                client_transaction_id =vault.get_hook_execution_id()+'PRINCIPAL_DAILY'+ 'last day',
+                asset=DEFAULT_ASSET
+            ))
+            vault.instruct_posting_batch(
+                posting_instructions = posting_ins,
+                effective_date = effective_date
+            )
+        # normal month
+        else:
+            amount_interest_last_day_installment = interest_per_month - balances[('ACCRUED_INTEREST', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+            amount_principal_last_day_installment = principal_per_month - balances[('ACCRUED_PRINCIPAL', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+            
+            posting_ins = vault.make_internal_transfer_instructions(
+                amount = amount_interest_last_day_installment,
+                denomination = denomination,
+                from_account_id = vault.account_id,
+                from_account_address = 'ACCRUED_INTEREST',
+                to_account_id =  vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={'type':'interest normal month last day'},
+                client_transaction_id =vault.get_hook_execution_id()+'INTEREST_DAILY'+ 'normal month last day',
+                asset=DEFAULT_ASSET
+            )
+            posting_ins.extend(vault.make_internal_transfer_instructions(
+                amount = amount_principal_last_day_installment,
+                denomination = denomination,
+                from_account_id = vault.account_id,
+                from_account_address = 'ACCRUED_PRINCIPAL',
+                to_account_id =  vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={'type':'principal normal month last day'},
+                client_transaction_id =vault.get_hook_execution_id()+'PRINCIPAL_DAILY'+ 'normal month last day',
+                asset=DEFAULT_ASSET
+
+            ))
+            vault.instruct_posting_batch(
+                posting_instructions = posting_ins,
+                effective_date = effective_date
+            )
+
+    # Normal day installment
+    else:
+        # Last month installment
+        if effective_date + timedelta(months=1) > last_default_day :
+            amount_principal_last_day_installment =_precision_up_2_decimal(outstanding_principal / num_days_in_installment) 
+            amount_interest_last_day_installment = _precision_up_2_decimal((last_emi - outstanding_principal)/num_days_in_installment)
+            if amount_principal_last_day_installment > 0 and amount_interest_last_day_installment > 0:
+                posting_ins = vault.make_internal_transfer_instructions(
+                amount = amount_interest_last_day_installment,
+                denomination = denomination, 
+                from_account_id = vault.account_id,
+                from_account_address = 'ACCRUED_INTEREST',
+                to_account_id =  vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={'type':'interest last month normal day'},
+                client_transaction_id =vault.get_hook_execution_id()+'INTEREST_DAILY' + 'last month normal day'+f'{amount_principal_last_day_installment}',
+                asset=DEFAULT_ASSET
+                )
+                posting_ins.extend(vault.make_internal_transfer_instructions(
+                    amount = amount_principal_last_day_installment,
+                    denomination = denomination,
+                    from_account_id = vault.account_id,
+                    from_account_address = 'ACCRUED_PRINCIPAL',
+                    to_account_id =  vault.account_id,
+                    to_account_address = 'INTERNAL_CONTRA',
+                    instruction_details={'type':'accrued principal normal day last month'},
+                    client_transaction_id =vault.get_hook_execution_id()+'PRINCIPAL_DAILY'+ 'last month normal day' + f'{amount_interest_last_day_installment}'
+                ))
+                vault.instruct_posting_batch(
+                posting_instructions = posting_ins,
+                effective_date = effective_date
+            )           
+        # Normal month installment 
+        else:
+            posting_ins = vault.make_internal_transfer_instructions(
+                amount = _precision_up_2_decimal(accrued_interest),
+                denomination = denomination,
+                client_transaction_id=vault.get_hook_execution_id()+'INTEREST_DAILY'+f'{outstanding_principal}',
+                from_account_id =vault.account_id,
+                from_account_address = 'ACCRUED_INTEREST',
+                to_account_id = vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={"type": "interest normal month normal day"},
+                asset=DEFAULT_ASSET
+            )
+            posting_ins.extend(vault.make_internal_transfer_instructions(
+                amount = _precision_up_2_decimal(accrued_principal),
+                denomination = denomination,
+                client_transaction_id=vault.get_hook_execution_id()+'PRINCIPAL_DAILY'+f'{accrued_principal, principal_per_month, num_days_in_installment}',
+                from_account_id =vault.account_id,
+                from_account_address = 'ACCRUED_PRINCIPAL',
+                to_account_id = vault.account_id,
+                to_account_address = 'INTERNAL_CONTRA',
+                instruction_details={"type": "principal normal month normal day"},
+                asset=DEFAULT_ASSET
+            ))
+            vault.instruct_posting_batch(
+                posting_instructions = posting_ins,
+                effective_date = effective_date
+        )   
+
+
+def _applied_monthly(vault, effective_date):
+    denomination = vault.get_parameter_timeseries(name='denomination').latest()
+    credit_card_account = vault.get_parameter_timeseries(name='credit_account_id').latest()
+    tenor=vault.get_parameter_timeseries(name='tenor').latest() 
+    balances = vault.get_balance_timeseries().latest()
+    fee = balances[('OUTSTANDING_FEE', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+    applied_principal_installment = balances[('ACCRUED_PRINCIPAL', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+    applied_interest_installment = balances[('ACCRUED_INTEREST', DEFAULT_ASSET, denomination, Phase.COMMITTED)].net
+    if effective_date.date() != _get_open_date(vault).date():
+        posting_ins = vault.make_internal_transfer_instructions(
+                amount = _precision_up_2_decimal(applied_interest_installment),
+                denomination = denomination,
+                client_transaction_id=vault.get_hook_execution_id()+'INTEREST_DAILY'+f'{applied_interest_installment}',
+                from_account_id =vault.account_id,
+                from_account_address = 'INTERNAL_CONTRA',
+                to_account_id = vault.account_id,
+                to_account_address = 'ACCRUED_INTEREST',
+                instruction_details={"type": "last month applied"},
+                asset=DEFAULT_ASSET
+            )
+        posting_ins.extend(vault.make_internal_transfer_instructions(
+            amount = _precision_up_2_decimal(applied_principal_installment),
+            denomination = denomination,
+            client_transaction_id=vault.get_hook_execution_id()+'PRINCIPAL_DAILY'+f'{applied_principal_installment}',
+            from_account_id =vault.account_id,
+            from_account_address = 'INTERNAL_CONTRA',
+            to_account_id = vault.account_id,
+            to_account_address = 'ACCRUED_PRINCIPAL',
+            instruction_details={"type": "LOAN_ON_CARD"},
+            asset=DEFAULT_ASSET
+        ))
+        posting_ins.extend(vault.make_internal_transfer_instructions(
+                amount = _precision_up_2_decimal(applied_interest_installment),
+                denomination = denomination,
+                client_transaction_id=vault.get_hook_execution_id()+'INTEREST_applied',
+                from_account_id =credit_card_account,
+                from_account_address = 'INTEREST_LOC',
+                to_account_id = vault.account_id,
+                to_account_address = 'OUTSTANDING_INTEREST',
+                instruction_details={"type": "LOAN_ON_CARD_ACTIVATION"},
+                asset=DEFAULT_ASSET
+            ))
+        posting_ins.extend(vault.make_internal_transfer_instructions(
+            amount = _precision_up_2_decimal(applied_principal_installment),
+            denomination = denomination,
+            client_transaction_id=vault.get_hook_execution_id()+'PRINCIPAL_applied',
+            from_account_id =credit_card_account,
+            from_account_address = 'PRINCIPAL_LOC',
+            to_account_id = vault.account_id,
+            to_account_address = 'OUTSTANDING_PRINCIPAL',
+            instruction_details={"type": "LOAN_ON_CARD"},
+            asset=DEFAULT_ASSET
+        ))
+        vault.instruct_posting_batch(
+            posting_instructions = posting_ins,
+            effective_date = effective_date
+        ) 
+    
+        if fee > 0:
+            posting_ins = vault.make_internal_transfer_instructions(
+                amount = fee,
+                denomination = denomination,
+                client_transaction_id=vault.get_hook_execution_id()+'transfer fee',
+                from_account_id =credit_card_account,
+                from_account_address = 'FEE_LOC',
+                to_account_id = vault.account_id,
+                to_account_address = 'OUTSTANDING_FEE',
+                instruction_details={"type": "LOAN_ON_CARD_ACTIVATION"},
+                asset=DEFAULT_ASSET
+            )
+            vault.instruct_posting_batch(
+                posting_instructions = posting_ins,
+                effective_date = effective_date
+            ) 
+        
+        if effective_date.month == (_get_open_date(vault).month + tenor)%12:
+            _remove_schedule(vault, event_type='ACCRUED_INTEREST')
+            _remove_schedule(vault, event_type='APPLIED_INTEREST')
+       
+def _remove_schedule(vault, event_type):
+    vault.remove_schedule(event_type=event_type)
+
+
+def _set_up_interest_fee(vault, tenor):
+    tenor = vault.get_parameter_timeseries(name='tenor').latest()
+    if tenor == 6:
+        fee_rate, interest_rate = Decimal('0.0349'), Decimal('0.06')
+    elif tenor == 9:
+        fee_rate, interest_rate = Decimal('0.0449'), Decimal('0.08')
+    elif tenor == 12:
+        fee_rate, interest_rate = Decimal('0.0549'), Decimal('0.12')
+    else:
+        fee_rate, interest_rate = Decimal('0.0125'), Decimal('0.04')
+    dict_rate={'tenor':tenor, 'fee_rate':fee_rate, 'interest_rate':interest_rate}
+
+    return dict_rate
+
+def _precision_up_2_decimal(amount):
+    return amount.copy_abs().quantize(Decimal('.01'), rounding=ROUND_CEILING)
+
+def _get_number_days_in_installment(vault):
+    open_date = vault.get_account_creation_date()
+    last_apply_day = vault.get_last_execution_time(event_type='APPLIED_INTEREST')
+    if last_apply_day:
+        next_schedule = last_apply_day + timedelta(months=1)
+        days = (next_schedule - last_apply_day).days
+    else:
+        next_schedule = open_date + timedelta(months=1)
+        days = (next_schedule - open_date).days
+    return days
